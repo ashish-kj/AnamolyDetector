@@ -61,6 +61,11 @@ class LiveDataStreamer:
         self.buffer_size = 50  # Keep last 50 samples for analysis
         self.distances = None
         
+        # Anomaly storage
+        self.anomaly_log_file = f"anomaly_log_{datetime.now().strftime('%Y%m%d')}.json"
+        self.anomaly_storage = []
+        self._load_existing_anomalies()
+        
         logger.info(f"Initialized LiveDataStreamer with {len(self.csv_files)} files")
     
     def _get_csv_files(self) -> List[str]:
@@ -118,6 +123,36 @@ class LiveDataStreamer:
         
         return 1.0
     
+    def _load_existing_anomalies(self):
+        """Load existing anomalies from log file"""
+        if os.path.exists(self.anomaly_log_file):
+            try:
+                with open(self.anomaly_log_file, 'r') as f:
+                    self.anomaly_storage = json.load(f)
+                logger.info(f"Loaded {len(self.anomaly_storage)} existing anomalies")
+            except Exception as e:
+                logger.error(f"Error loading anomalies: {e}")
+                self.anomaly_storage = []
+    
+    def _save_anomaly(self, anomaly):
+        """Save anomaly to local storage"""
+        try:
+            # Add to memory storage
+            self.anomaly_storage.append(anomaly)
+            
+            # Save to file
+            with open(self.anomaly_log_file, 'w') as f:
+                json.dump(self.anomaly_storage, f, indent=2, default=str)
+            
+            # Keep only last 10000 anomalies to prevent file from getting too large
+            if len(self.anomaly_storage) > 10000:
+                self.anomaly_storage = self.anomaly_storage[-10000:]
+                with open(self.anomaly_log_file, 'w') as f:
+                    json.dump(self.anomaly_storage, f, indent=2, default=str)
+                    
+        except Exception as e:
+            logger.error(f"Error saving anomaly: {e}")
+    
     def start_streaming(self) -> None:
         """Start streaming data"""
         if self.streaming:
@@ -131,15 +166,26 @@ class LiveDataStreamer:
         # Start streaming thread
         self.stream_thread = threading.Thread(target=self._stream_data, daemon=True)
         self.stream_thread.start()
+        logger.info("Started streaming thread")
     
     def stop_streaming(self) -> None:
         """Stop streaming data"""
         self.streaming = False
         logger.info("Stopped data streaming")
+        
+        # Reset streaming state
+        self.current_file_index = 0
+        self.current_row_index = 0
     
     def _stream_data(self) -> None:
         """Main streaming loop"""
+        logger.info("Starting data streaming loop")
         while self.streaming and self.current_file_index < len(self.csv_files):
+            # Check streaming status at the start of each iteration
+            if not self.streaming:
+                logger.info("Streaming stopped by user")
+                break
+                
             try:
                 # Load current file if needed
                 current_file = self.csv_files[self.current_file_index]
@@ -184,8 +230,13 @@ class LiveDataStreamer:
                         anomalies = self._detect_anomalies()
                         if anomalies:
                             for anomaly in anomalies:
-                                socketio.emit('anomaly_detected', anomaly)
-                                logger.warning(f"Anomaly detected: {anomaly['type']} at {anomaly['position_km']:.3f}km")
+                                # Save to local storage
+                                self._save_anomaly(anomaly)
+                                
+                                # Only emit high-confidence anomalies to reduce noise
+                                if anomaly['confidence'] >= 0.3:  # Minimum threshold for display
+                                    socketio.emit('anomaly_detected', anomaly)
+                                    logger.warning(f"Anomaly detected: {anomaly['type']} at {anomaly['position_km']:.3f}km (confidence: {anomaly['confidence']:.3f})")
                     
                     self.current_row_index += 1
                 else:
@@ -194,11 +245,16 @@ class LiveDataStreamer:
                     self.current_row_index = 0
                     logger.info(f"Completed file {self.current_file_index}/{len(self.csv_files)}")
                 
-                time.sleep(self.stream_interval)
-                
-            except Exception as e:
-                logger.error(f"Error in streaming loop: {e}")
-                time.sleep(1.0)
+                    time.sleep(self.stream_interval)
+                    
+                    # Check if streaming was stopped during sleep
+                    if not self.streaming:
+                        logger.info("Streaming stopped during sleep")
+                        break
+                    
+                except Exception as e:
+                    logger.error(f"Error in streaming loop: {e}")
+                    time.sleep(1.0)
         
         logger.info("Streaming completed")
         self.streaming = False
@@ -215,12 +271,12 @@ class LiveDataStreamer:
             # Quick anomaly detection using statistical methods
             anomalies = []
             
-            # Method 1: Z-score based detection
+            # Method 1: Z-score based detection (more selective)
             z_scores = np.abs((recent_data[-1] - np.mean(recent_data[:-1], axis=0)) / 
                             (np.std(recent_data[:-1], axis=0) + 1e-6))
             
-            # Find locations with high z-scores
-            anomaly_indices = np.where(z_scores > 3.0)[0]
+            # Find locations with high z-scores (increased threshold)
+            anomaly_indices = np.where(z_scores > 4.0)[0]
             
             for idx in anomaly_indices:
                 if idx < len(self.distances):
@@ -229,12 +285,12 @@ class LiveDataStreamer:
                         'type': 'Statistical Anomaly',
                         'position_m': self.distances[idx],
                         'position_km': self.distances[idx] / 1000,
-                        'confidence': min(1.0, z_scores[idx] / 5.0),
-                        'severity': 'HIGH' if z_scores[idx] > 5.0 else 'MEDIUM' if z_scores[idx] > 4.0 else 'LOW',
+                        'confidence': min(1.0, z_scores[idx] / 6.0),
+                        'severity': 'HIGH' if z_scores[idx] > 6.0 else 'MEDIUM' if z_scores[idx] > 5.0 else 'LOW',
                         'z_score': float(z_scores[idx]),
                         'measurement_value': float(recent_data[-1][idx]),
                         'baseline_mean': float(np.mean(recent_data[:-1], axis=0)[idx]),
-                        'reason': f'Z-score of {z_scores[idx]:.2f} exceeds threshold of 3.0'
+                        'reason': f'Z-score of {z_scores[idx]:.2f} exceeds threshold of 4.0'
                     }
                     anomalies.append(anomaly)
             
@@ -242,7 +298,7 @@ class LiveDataStreamer:
             if len(self.data_buffer) >= 5:
                 recent_5 = np.array([point['measurements'] for point in self.data_buffer[-5:]])
                 amplitude_changes = np.abs(recent_5[-1] - np.mean(recent_5[:-1], axis=0))
-                threshold = np.std(recent_5[:-1], axis=0) * 2.5
+                threshold = np.std(recent_5[:-1], axis=0) * 3.5  # More selective threshold
                 
                 sudden_change_indices = np.where(amplitude_changes > threshold)[0]
                 
@@ -254,8 +310,8 @@ class LiveDataStreamer:
                             'type': 'Sudden Amplitude Change',
                             'position_m': self.distances[idx],
                             'position_km': self.distances[idx] / 1000,
-                            'confidence': min(1.0, change_magnitude / 3.0),
-                            'severity': 'HIGH' if change_magnitude > 4.0 else 'MEDIUM' if change_magnitude > 3.0 else 'LOW',
+                            'confidence': min(1.0, change_magnitude / 4.0),
+                            'severity': 'HIGH' if change_magnitude > 5.0 else 'MEDIUM' if change_magnitude > 4.0 else 'LOW',
                             'change_magnitude': float(change_magnitude),
                             'measurement_value': float(recent_5[-1][idx]),
                             'baseline_mean': float(np.mean(recent_5[:-1], axis=0)[idx]),
@@ -282,7 +338,9 @@ class LiveDataStreamer:
         }
 
 # Flask application setup
-app = Flask(__name__)
+import os
+template_folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'templates')
+app = Flask(__name__, template_folder=template_folder)
 app.config['SECRET_KEY'] = 'pipeline_monitoring_secret_key'
 socketio = SocketIO(app, cors_allowed_origins="*")
 
@@ -318,8 +376,39 @@ def stop_streaming():
     """Stop data streaming"""
     if streamer and streamer.streaming:
         streamer.stop_streaming()
-        return jsonify({'status': 'stopped'})
-    return jsonify({'status': 'not_running'})
+        logger.info("Stop command received via API")
+        return jsonify({'status': 'stopped', 'message': 'Streaming stopped successfully'})
+    return jsonify({'status': 'not_running', 'message': 'No active streaming to stop'})
+
+@app.route('/api/anomalies')
+def get_anomalies():
+    """Get anomaly statistics and recent anomalies"""
+    if not streamer:
+        return jsonify({'error': 'Streamer not initialized'})
+    
+    total_anomalies = len(streamer.anomaly_storage)
+    recent_anomalies = streamer.anomaly_storage[-100:] if streamer.anomaly_storage else []
+    
+    # Calculate statistics
+    if streamer.anomaly_storage:
+        severity_counts = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+        type_counts = {}
+        
+        for anomaly in streamer.anomaly_storage:
+            severity_counts[anomaly.get('severity', 'LOW')] += 1
+            anomaly_type = anomaly.get('type', 'Unknown')
+            type_counts[anomaly_type] = type_counts.get(anomaly_type, 0) + 1
+    else:
+        severity_counts = {'HIGH': 0, 'MEDIUM': 0, 'LOW': 0}
+        type_counts = {}
+    
+    return jsonify({
+        'total_anomalies': total_anomalies,
+        'recent_anomalies': recent_anomalies,
+        'severity_counts': severity_counts,
+        'type_counts': type_counts,
+        'log_file': streamer.anomaly_log_file
+    })
 
 @socketio.on('connect')
 def handle_connect():
@@ -334,7 +423,9 @@ def handle_disconnect():
 
 def create_dashboard_template():
     """Create the HTML dashboard template"""
-    template_dir = 'templates'
+    # Create template directory relative to the script's parent directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    template_dir = os.path.join(script_dir, '..', 'templates')
     if not os.path.exists(template_dir):
         os.makedirs(template_dir)
     
@@ -389,6 +480,14 @@ def create_dashboard_template():
             font-size: 24px;
             font-weight: bold;
             color: #667eea;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            max-width: 100%;
+            line-height: 1.2;
+        }
+        .status-value.filename {
+            font-size: 14px;
+            font-weight: normal;
         }
         .chart-container {
             background: white;
@@ -474,12 +573,22 @@ def create_dashboard_template():
         <button id="stopBtn" class="btn btn-danger" onclick="stopStreaming()">Stop Monitoring</button>
         <span id="streamingStatus">Status: Not Connected</span>
         <span id="streamingIndicator" class="streaming-indicator streaming-inactive"></span>
+        
+        <div style="margin-top: 15px;">
+            <label><strong>Alert Filters:</strong></label>
+            <label><input type="checkbox" id="filterHigh" checked> HIGH Severity</label>
+            <label><input type="checkbox" id="filterMedium" checked> MEDIUM Severity</label>
+            <label><input type="checkbox" id="filterLow"> LOW Severity</label>
+            <label style="margin-left: 20px;"><strong>Min Confidence:</strong></label>
+            <input type="range" id="confidenceSlider" min="0" max="1" step="0.1" value="0.5">
+            <span id="confidenceValue">0.5</span>
+        </div>
     </div>
 
     <div class="status-grid">
         <div class="status-card">
             <h3>Current File</h3>
-            <div id="currentFile" class="status-value">-</div>
+            <div id="currentFile" class="status-value filename">-</div>
         </div>
         <div class="status-card">
             <h3>Progress</h3>
@@ -490,8 +599,8 @@ def create_dashboard_template():
             <div id="dataPoints" class="status-value">0</div>
         </div>
         <div class="status-card">
-            <h3>Anomalies</h3>
-            <div id="anomalyCount" class="status-value">0</div>
+            <h3>Anomalies (Shown/Total)</h3>
+            <div id="anomalyCount" class="status-value">0/0</div>
         </div>
     </div>
 
@@ -509,7 +618,16 @@ def create_dashboard_template():
         const socket = io();
         let signalData = [];
         let anomalies = [];
+        let allAnomalies = []; // Store all anomalies for filtering
         let maxDataPoints = 100;
+        
+        // Filtering settings
+        let filterSettings = {
+            showHigh: true,
+            showMedium: true,
+            showLow: false,
+            minConfidence: 0.5
+        };
 
         // Initialize chart
         let signalTrace = {
@@ -558,10 +676,29 @@ def create_dashboard_template():
         });
 
         socket.on('anomaly_detected', function(anomaly) {
-            anomalies.push(anomaly);
-            addAnomalyAlert(anomaly);
-            document.getElementById('anomalyCount').textContent = anomalies.length;
+            allAnomalies.push(anomaly);
+            
+            // Check if anomaly passes filters
+            if (shouldShowAnomaly(anomaly)) {
+                anomalies.push(anomaly);
+                addAnomalyAlert(anomaly);
+            }
+            
+            // Update counts (show filtered vs total)
+            document.getElementById('anomalyCount').textContent = `${anomalies.length}/${allAnomalies.length}`;
         });
+        
+        function shouldShowAnomaly(anomaly) {
+            // Check severity filter
+            if (anomaly.severity === 'HIGH' && !filterSettings.showHigh) return false;
+            if (anomaly.severity === 'MEDIUM' && !filterSettings.showMedium) return false;
+            if (anomaly.severity === 'LOW' && !filterSettings.showLow) return false;
+            
+            // Check confidence filter
+            if (anomaly.confidence < filterSettings.minConfidence) return false;
+            
+            return true;
+        }
 
         function addAnomalyAlert(anomaly) {
             const alertsList = document.getElementById('alertsList');
@@ -596,11 +733,19 @@ def create_dashboard_template():
         }
 
         function stopStreaming() {
+            console.log('Stop button clicked');
             fetch('/api/stop', {method: 'POST'})
                 .then(response => response.json())
                 .then(data => {
-                    console.log('Stopped streaming:', data);
+                    console.log('Stop response:', data);
+                    if (data.status === 'stopped') {
+                        document.getElementById('streamingStatus').textContent = 'Status: Stopped';
+                        document.getElementById('streamingIndicator').className = 'streaming-indicator streaming-inactive';
+                    }
                     updateStatus();
+                })
+                .catch(error => {
+                    console.error('Error stopping stream:', error);
                 });
         }
 
@@ -613,7 +758,7 @@ def create_dashboard_template():
                         return;
                     }
                     
-                    document.getElementById('currentFile').textContent = data.current_file || '-';
+                    updateFilename(data.current_file);
                     document.getElementById('progress').textContent = `${data.current_file_index}/${data.total_files}`;
                     
                     const indicator = document.getElementById('streamingIndicator');
@@ -629,6 +774,58 @@ def create_dashboard_template():
                 });
         }
 
+        // Filter control event handlers
+        document.getElementById('filterHigh').addEventListener('change', function(e) {
+            filterSettings.showHigh = e.target.checked;
+            applyFilters();
+        });
+        
+        document.getElementById('filterMedium').addEventListener('change', function(e) {
+            filterSettings.showMedium = e.target.checked;
+            applyFilters();
+        });
+        
+        document.getElementById('filterLow').addEventListener('change', function(e) {
+            filterSettings.showLow = e.target.checked;
+            applyFilters();
+        });
+        
+        document.getElementById('confidenceSlider').addEventListener('input', function(e) {
+            filterSettings.minConfidence = parseFloat(e.target.value);
+            document.getElementById('confidenceValue').textContent = e.target.value;
+            applyFilters();
+        });
+        
+        function applyFilters() {
+            // Clear current display
+            anomalies = [];
+            const alertsList = document.getElementById('alertsList');
+            alertsList.innerHTML = '';
+            
+            // Re-filter all anomalies
+            allAnomalies.forEach(anomaly => {
+                if (shouldShowAnomaly(anomaly)) {
+                    anomalies.push(anomaly);
+                    addAnomalyAlert(anomaly);
+                }
+            });
+            
+            // Update count
+            document.getElementById('anomalyCount').textContent = `${anomalies.length}/${allAnomalies.length}`;
+        }
+        
+        function updateFilename(filename) {
+            // Truncate long filenames for display
+            const maxLength = 25;
+            if (filename && filename.length > maxLength) {
+                const truncated = filename.substring(0, maxLength) + '...';
+                document.getElementById('currentFile').textContent = truncated;
+                document.getElementById('currentFile').title = filename; // Show full name on hover
+            } else {
+                document.getElementById('currentFile').textContent = filename || '-';
+            }
+        }
+
         // Update status periodically
         setInterval(updateStatus, 2000);
         updateStatus();
@@ -636,7 +833,7 @@ def create_dashboard_template():
 </body>
 </html>'''
     
-    with open(os.path.join(template_dir, 'dashboard.html'), 'w') as f:
+    with open(os.path.join(template_dir, 'dashboard.html'), 'w', encoding='utf-8') as f:
         f.write(html_content)
     
     logger.info("Created dashboard template")
