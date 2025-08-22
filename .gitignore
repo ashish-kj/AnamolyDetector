@@ -38,11 +38,15 @@ venv.bak/
 *~
 
 # Jupyter Notebook
-.ipynb_checkpoints
+.ipynb_checkpoints/
+*.ipynb
 
-# Data files (uncomment if you don't want to commit large data files)
-# TestData/*.csv
-# *.csv
+# Data files - CSV files are typically large and should not be committed
+TestData/*.csv
+*.csv
+
+# Anomaly detection logs
+anomaly_log_*.json
 
 # Generated files
 templates/dashboard.html

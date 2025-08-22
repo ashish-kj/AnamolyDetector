@@ -66,6 +66,20 @@ class LiveDataStreamer:
         self.anomaly_storage = []
         self._load_existing_anomalies()
         
+        # Detection configuration
+        self.config = {
+            'zscoreThreshold': 4.0,
+            'zscoreHigh': 6.0,
+            'zscoreMedium': 5.0,
+            'zscoreLow': 4.0,
+            'amplitudeThreshold': 3.5,
+            'amplitudeHigh': 5.0,
+            'amplitudeMedium': 4.0,
+            'amplitudeLow': 3.5,
+            'minConfidence': 0.3,
+            'maxAlertsPerSecond': 5
+        }
+        
         logger.info(f"Initialized LiveDataStreamer with {len(self.csv_files)} files")
     
     def _get_csv_files(self) -> List[str]:
@@ -153,6 +167,11 @@ class LiveDataStreamer:
         except Exception as e:
             logger.error(f"Error saving anomaly: {e}")
     
+    def update_config(self, config_data):
+        """Update detection configuration"""
+        self.config.update(config_data)
+        logger.info(f"Updated configuration: {self.config}")
+    
     def start_streaming(self) -> None:
         """Start streaming data"""
         if self.streaming:
@@ -234,7 +253,7 @@ class LiveDataStreamer:
                                 self._save_anomaly(anomaly)
                                 
                                 # Only emit high-confidence anomalies to reduce noise
-                                if anomaly['confidence'] >= 0.3:  # Minimum threshold for display
+                                if anomaly['confidence'] >= self.config['minConfidence']:  # Configurable minimum threshold
                                     socketio.emit('anomaly_detected', anomaly)
                                     logger.warning(f"Anomaly detected: {anomaly['type']} at {anomaly['position_km']:.3f}km (confidence: {anomaly['confidence']:.3f})")
                     
@@ -252,9 +271,9 @@ class LiveDataStreamer:
                         logger.info("Streaming stopped during sleep")
                         break
                     
-                except Exception as e:
-                    logger.error(f"Error in streaming loop: {e}")
-                    time.sleep(1.0)
+            except Exception as e:
+                logger.error(f"Error in streaming loop: {e}")
+                time.sleep(1.0)
         
         logger.info("Streaming completed")
         self.streaming = False
@@ -271,12 +290,12 @@ class LiveDataStreamer:
             # Quick anomaly detection using statistical methods
             anomalies = []
             
-            # Method 1: Z-score based detection (more selective)
+            # Method 1: Z-score based detection (configurable threshold)
             z_scores = np.abs((recent_data[-1] - np.mean(recent_data[:-1], axis=0)) / 
                             (np.std(recent_data[:-1], axis=0) + 1e-6))
             
-            # Find locations with high z-scores (increased threshold)
-            anomaly_indices = np.where(z_scores > 4.0)[0]
+            # Find locations with high z-scores (configurable threshold)
+            anomaly_indices = np.where(z_scores > self.config['zscoreThreshold'])[0]
             
             for idx in anomaly_indices:
                 if idx < len(self.distances):
@@ -285,12 +304,12 @@ class LiveDataStreamer:
                         'type': 'Statistical Anomaly',
                         'position_m': self.distances[idx],
                         'position_km': self.distances[idx] / 1000,
-                        'confidence': min(1.0, z_scores[idx] / 6.0),
-                        'severity': 'HIGH' if z_scores[idx] > 6.0 else 'MEDIUM' if z_scores[idx] > 5.0 else 'LOW',
+                        'confidence': min(1.0, z_scores[idx] / (self.config['zscoreHigh'] + 1.0)),
+                        'severity': 'HIGH' if z_scores[idx] > self.config['zscoreHigh'] else 'MEDIUM' if z_scores[idx] > self.config['zscoreMedium'] else 'LOW',
                         'z_score': float(z_scores[idx]),
                         'measurement_value': float(recent_data[-1][idx]),
                         'baseline_mean': float(np.mean(recent_data[:-1], axis=0)[idx]),
-                        'reason': f'Z-score of {z_scores[idx]:.2f} exceeds threshold of 4.0'
+                        'reason': f'Z-score of {z_scores[idx]:.2f} exceeds threshold of {self.config["zscoreThreshold"]:.1f}'
                     }
                     anomalies.append(anomaly)
             
@@ -298,7 +317,7 @@ class LiveDataStreamer:
             if len(self.data_buffer) >= 5:
                 recent_5 = np.array([point['measurements'] for point in self.data_buffer[-5:]])
                 amplitude_changes = np.abs(recent_5[-1] - np.mean(recent_5[:-1], axis=0))
-                threshold = np.std(recent_5[:-1], axis=0) * 3.5  # More selective threshold
+                threshold = np.std(recent_5[:-1], axis=0) * self.config['amplitudeThreshold']
                 
                 sudden_change_indices = np.where(amplitude_changes > threshold)[0]
                 
@@ -310,8 +329,8 @@ class LiveDataStreamer:
                             'type': 'Sudden Amplitude Change',
                             'position_m': self.distances[idx],
                             'position_km': self.distances[idx] / 1000,
-                            'confidence': min(1.0, change_magnitude / 4.0),
-                            'severity': 'HIGH' if change_magnitude > 5.0 else 'MEDIUM' if change_magnitude > 4.0 else 'LOW',
+                            'confidence': min(1.0, change_magnitude / (self.config['amplitudeHigh'] + 1.0)),
+                            'severity': 'HIGH' if change_magnitude > self.config['amplitudeHigh'] else 'MEDIUM' if change_magnitude > self.config['amplitudeMedium'] else 'LOW',
                             'change_magnitude': float(change_magnitude),
                             'measurement_value': float(recent_5[-1][idx]),
                             'baseline_mean': float(np.mean(recent_5[:-1], axis=0)[idx]),
@@ -379,6 +398,25 @@ def stop_streaming():
         logger.info("Stop command received via API")
         return jsonify({'status': 'stopped', 'message': 'Streaming stopped successfully'})
     return jsonify({'status': 'not_running', 'message': 'No active streaming to stop'})
+
+@app.route('/api/configure', methods=['POST'])
+def configure_thresholds():
+    """Configure detection thresholds"""
+    if not streamer:
+        return jsonify({'error': 'Streamer not initialized'})
+    
+    try:
+        config_data = request.get_json()
+        logger.info(f"Received configuration: {config_data}")
+        
+        # Update streamer configuration (we'll implement this in the streamer)
+        if hasattr(streamer, 'update_config'):
+            streamer.update_config(config_data)
+        
+        return jsonify({'status': 'configured', 'config': config_data})
+    except Exception as e:
+        logger.error(f"Error configuring thresholds: {e}")
+        return jsonify({'error': str(e)})
 
 @app.route('/api/anomalies')
 def get_anomalies():
@@ -489,6 +527,130 @@ def create_dashboard_template():
             font-size: 14px;
             font-weight: normal;
         }
+        
+        /* Configuration Modal */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        .modal-content {
+            background-color: white;
+            margin: 5% auto;
+            padding: 30px;
+            border-radius: 10px;
+            width: 80%;
+            max-width: 600px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+        .modal-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #f0f0f0;
+            padding-bottom: 15px;
+        }
+        .close {
+            color: #aaa;
+            float: right;
+            font-size: 28px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .close:hover {
+            color: black;
+        }
+        .config-section {
+            margin-bottom: 25px;
+            padding: 15px;
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+        }
+        .config-section h3 {
+            margin-top: 0;
+            color: #333;
+            border-bottom: 1px solid #f0f0f0;
+            padding-bottom: 8px;
+        }
+        .threshold-control {
+            display: flex;
+            align-items: center;
+            margin: 10px 0;
+            gap: 15px;
+        }
+        .threshold-control label {
+            min-width: 120px;
+            font-weight: bold;
+        }
+        .threshold-input {
+            padding: 5px 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            width: 80px;
+        }
+        .severity-range {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin: 8px 0;
+        }
+        .severity-label {
+            min-width: 80px;
+            padding: 4px 8px;
+            border-radius: 4px;
+            color: white;
+            font-weight: bold;
+            text-align: center;
+        }
+        .severity-high { background-color: #dc3545; }
+        .severity-medium { background-color: #ffc107; color: #333; }
+        .severity-low { background-color: #28a745; }
+        
+        /* Tabs for anomaly alerts */
+        .tabs {
+            display: flex;
+            border-bottom: 2px solid #e0e0e0;
+            margin-bottom: 15px;
+        }
+        .tab {
+            padding: 10px 20px;
+            cursor: pointer;
+            border: none;
+            background: none;
+            font-size: 14px;
+            font-weight: bold;
+            color: #666;
+            transition: all 0.3s;
+        }
+        .tab.active {
+            color: #667eea;
+            border-bottom: 2px solid #667eea;
+        }
+        .tab:hover {
+            color: #667eea;
+            background-color: #f8f9ff;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .tab-badge {
+            background: #667eea;
+            color: white;
+            border-radius: 12px;
+            padding: 2px 8px;
+            font-size: 11px;
+            margin-left: 5px;
+        }
         .chart-container {
             background: white;
             padding: 20px;
@@ -538,6 +700,10 @@ def create_dashboard_template():
             background-color: #f44336;
             color: white;
         }
+        .btn-secondary {
+            background-color: #6c757d;
+            color: white;
+        }
         .btn:hover {
             opacity: 0.8;
         }
@@ -569,20 +735,11 @@ def create_dashboard_template():
     </div>
 
     <div class="controls">
-        <button id="startBtn" class="btn btn-primary" onclick="startStreaming()">Start Monitoring</button>
+        <button id="configBtn" class="btn btn-secondary" onclick="openConfigModal()">⚙️ Configure Thresholds</button>
+        <button id="startBtn" class="btn btn-primary" onclick="showStartModal()">Start Monitoring</button>
         <button id="stopBtn" class="btn btn-danger" onclick="stopStreaming()">Stop Monitoring</button>
         <span id="streamingStatus">Status: Not Connected</span>
         <span id="streamingIndicator" class="streaming-indicator streaming-inactive"></span>
-        
-        <div style="margin-top: 15px;">
-            <label><strong>Alert Filters:</strong></label>
-            <label><input type="checkbox" id="filterHigh" checked> HIGH Severity</label>
-            <label><input type="checkbox" id="filterMedium" checked> MEDIUM Severity</label>
-            <label><input type="checkbox" id="filterLow"> LOW Severity</label>
-            <label style="margin-left: 20px;"><strong>Min Confidence:</strong></label>
-            <input type="range" id="confidenceSlider" min="0" max="1" step="0.1" value="0.5">
-            <span id="confidenceValue">0.5</span>
-        </div>
     </div>
 
     <div class="status-grid">
@@ -611,7 +768,125 @@ def create_dashboard_template():
 
     <div class="alerts-container">
         <h3>🚨 Anomaly Alerts</h3>
-        <div id="alertsList"></div>
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('all')">All <span id="allCount" class="tab-badge">0</span></button>
+            <button class="tab" onclick="switchTab('high')">High <span id="highCount" class="tab-badge">0</span></button>
+            <button class="tab" onclick="switchTab('medium')">Medium <span id="mediumCount" class="tab-badge">0</span></button>
+            <button class="tab" onclick="switchTab('low')">Low <span id="lowCount" class="tab-badge">0</span></button>
+        </div>
+        <div id="allTab" class="tab-content active"></div>
+        <div id="highTab" class="tab-content"></div>
+        <div id="mediumTab" class="tab-content"></div>
+        <div id="lowTab" class="tab-content"></div>
+    </div>
+
+    <!-- Configuration Modal -->
+    <div id="configModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>🔧 Configure Detection Thresholds</h2>
+                <span class="close" onclick="closeConfigModal()">&times;</span>
+            </div>
+            
+            <div class="config-section">
+                <h3>📊 Statistical Anomaly Detection</h3>
+                <p>Z-score based detection for unusual signal patterns</p>
+                <div class="threshold-control">
+                    <label>Detection Threshold:</label>
+                    <input type="number" id="zscoreThreshold" class="threshold-input" value="4.0" min="2.0" max="10.0" step="0.1">
+                    <span>standard deviations</span>
+                </div>
+                <div class="severity-range">
+                    <div class="severity-label severity-high">HIGH</div>
+                    <span>></span>
+                    <input type="number" id="zscoreHigh" class="threshold-input" value="6.0" min="4.0" max="15.0" step="0.1">
+                </div>
+                <div class="severity-range">
+                    <div class="severity-label severity-medium">MEDIUM</div>
+                    <span>></span>
+                    <input type="number" id="zscoreMedium" class="threshold-input" value="5.0" min="3.0" max="10.0" step="0.1">
+                </div>
+                <div class="severity-range">
+                    <div class="severity-label severity-low">LOW</div>
+                    <span>></span>
+                    <input type="number" id="zscoreLow" class="threshold-input" value="4.0" min="2.0" max="8.0" step="0.1">
+                </div>
+            </div>
+            
+            <div class="config-section">
+                <h3>⚡ Sudden Amplitude Change Detection</h3>
+                <p>Detects rapid signal changes that could indicate leaks</p>
+                <div class="threshold-control">
+                    <label>Detection Threshold:</label>
+                    <input type="number" id="amplitudeThreshold" class="threshold-input" value="3.5" min="2.0" max="8.0" step="0.1">
+                    <span>× baseline variation</span>
+                </div>
+                <div class="severity-range">
+                    <div class="severity-label severity-high">HIGH</div>
+                    <span>></span>
+                    <input type="number" id="amplitudeHigh" class="threshold-input" value="5.0" min="3.0" max="10.0" step="0.1">
+                    <span>× baseline</span>
+                </div>
+                <div class="severity-range">
+                    <div class="severity-label severity-medium">MEDIUM</div>
+                    <span>></span>
+                    <input type="number" id="amplitudeMedium" class="threshold-input" value="4.0" min="2.5" max="8.0" step="0.1">
+                    <span>× baseline</span>
+                </div>
+                <div class="severity-range">
+                    <div class="severity-label severity-low">LOW</div>
+                    <span>></span>
+                    <input type="number" id="amplitudeLow" class="threshold-input" value="3.5" min="2.0" max="6.0" step="0.1">
+                    <span>× baseline</span>
+                </div>
+            </div>
+            
+            <div class="config-section">
+                <h3>🎚️ General Settings</h3>
+                <div class="threshold-control">
+                    <label>Min Confidence:</label>
+                    <input type="range" id="minConfidence" min="0" max="1" step="0.05" value="0.3">
+                    <span id="confidenceDisplay">0.3</span>
+                </div>
+                <div class="threshold-control">
+                    <label>Max Alerts/Second:</label>
+                    <input type="number" id="maxAlertsPerSecond" class="threshold-input" value="5" min="1" max="20" step="1">
+                    <span>alerts</span>
+                </div>
+            </div>
+            
+            <div style="text-align: center; margin-top: 20px;">
+                <button class="btn btn-primary" onclick="saveConfig()">💾 Save Configuration</button>
+                <button class="btn btn-secondary" onclick="resetConfig()">🔄 Reset to Defaults</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Start Monitoring Modal -->
+    <div id="startModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>🚀 Start Pipeline Monitoring</h2>
+                <span class="close" onclick="closeStartModal()">&times;</span>
+            </div>
+            
+            <div class="config-section">
+                <h3>📋 Current Configuration</h3>
+                <div id="configSummary"></div>
+            </div>
+            
+            <div class="config-section">
+                <h3>🎛️ Quick Filters</h3>
+                <label><input type="checkbox" id="quickFilterHigh" checked> Show HIGH Severity Alerts</label><br>
+                <label><input type="checkbox" id="quickFilterMedium" checked> Show MEDIUM Severity Alerts</label><br>
+                <label><input type="checkbox" id="quickFilterLow"> Show LOW Severity Alerts</label><br>
+            </div>
+            
+            <div style="text-align: center; margin-top: 20px;">
+                <button class="btn btn-primary" onclick="startMonitoring()">▶️ Start Monitoring</button>
+                <button class="btn btn-secondary" onclick="closeStartModal()">Cancel</button>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -621,13 +896,34 @@ def create_dashboard_template():
         let allAnomalies = []; // Store all anomalies for filtering
         let maxDataPoints = 100;
         
+        // Configuration settings
+        let config = {
+            zscoreThreshold: 4.0,
+            zscoreHigh: 6.0,
+            zscoreMedium: 5.0,
+            zscoreLow: 4.0,
+            amplitudeThreshold: 3.5,
+            amplitudeHigh: 5.0,
+            amplitudeMedium: 4.0,
+            amplitudeLow: 3.5,
+            minConfidence: 0.3,
+            maxAlertsPerSecond: 5
+        };
+        
         // Filtering settings
         let filterSettings = {
             showHigh: true,
             showMedium: true,
             showLow: false,
-            minConfidence: 0.5
+            minConfidence: 0.3
         };
+        
+        // Tab management
+        let currentTab = 'all';
+        let tabCounts = { all: 0, high: 0, medium: 0, low: 0 };
+        
+        // Load saved configuration
+        loadConfig();
 
         // Initialize chart
         let signalTrace = {
@@ -701,7 +997,28 @@ def create_dashboard_template():
         }
 
         function addAnomalyAlert(anomaly) {
-            const alertsList = document.getElementById('alertsList');
+            // Update tab counts
+            tabCounts.all++;
+            tabCounts[anomaly.severity.toLowerCase()]++;
+            updateTabCounts();
+            
+            // Add to appropriate tab
+            const alertDiv = createAlertElement(anomaly);
+            
+            // Add to all tab
+            const allTab = document.getElementById('allTab');
+            allTab.insertBefore(alertDiv.cloneNode(true), allTab.firstChild);
+            
+            // Add to severity-specific tab
+            const severityTab = document.getElementById(anomaly.severity.toLowerCase() + 'Tab');
+            severityTab.insertBefore(alertDiv, severityTab.firstChild);
+            
+            // Limit alerts per tab
+            limitAlertsInTab(allTab, 100);
+            limitAlertsInTab(severityTab, 50);
+        }
+        
+        function createAlertElement(anomaly) {
             const alertDiv = document.createElement('div');
             alertDiv.className = `alert alert-${anomaly.severity.toLowerCase()}`;
             
@@ -714,22 +1031,74 @@ def create_dashboard_template():
                 <strong>Confidence:</strong> ${(anomaly.confidence * 100).toFixed(1)}%<br>
                 <strong>Reason:</strong> ${anomaly.reason}
             `;
-            
-            alertsList.insertBefore(alertDiv, alertsList.firstChild);
-            
-            // Keep only recent alerts
-            while (alertsList.children.length > 10) {
-                alertsList.removeChild(alertsList.lastChild);
+            return alertDiv;
+        }
+        
+        function limitAlertsInTab(tab, maxAlerts) {
+            while (tab.children.length > maxAlerts) {
+                tab.removeChild(tab.lastChild);
             }
         }
+        
+        function updateTabCounts() {
+            document.getElementById('allCount').textContent = tabCounts.all;
+            document.getElementById('highCount').textContent = tabCounts.high;
+            document.getElementById('mediumCount').textContent = tabCounts.medium;
+            document.getElementById('lowCount').textContent = tabCounts.low;
+        }
+        
+        function switchTab(tabName) {
+            // Update active tab
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            
+            event.target.classList.add('active');
+            document.getElementById(tabName + 'Tab').classList.add('active');
+            currentTab = tabName;
+        }
 
+        // Modal management
+        function openConfigModal() {
+            updateConfigModal();
+            document.getElementById('configModal').style.display = 'block';
+        }
+        
+        function closeConfigModal() {
+            document.getElementById('configModal').style.display = 'none';
+        }
+        
+        function showStartModal() {
+            updateConfigSummary();
+            document.getElementById('startModal').style.display = 'block';
+        }
+        
+        function closeStartModal() {
+            document.getElementById('startModal').style.display = 'none';
+        }
+        
+        function startMonitoring() {
+            // Apply quick filters
+            filterSettings.showHigh = document.getElementById('quickFilterHigh').checked;
+            filterSettings.showMedium = document.getElementById('quickFilterMedium').checked;
+            filterSettings.showLow = document.getElementById('quickFilterLow').checked;
+            
+            closeStartModal();
+            startStreaming();
+        }
+        
         function startStreaming() {
-            fetch('/api/start', {method: 'POST'})
-                .then(response => response.json())
-                .then(data => {
-                    console.log('Started streaming:', data);
-                    updateStatus();
-                });
+            // Send configuration to backend
+            fetch('/api/configure', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(config)
+            }).then(() => {
+                return fetch('/api/start', {method: 'POST'});
+            }).then(response => response.json())
+            .then(data => {
+                console.log('Started streaming:', data);
+                updateStatus();
+            });
         }
 
         function stopStreaming() {
@@ -823,6 +1192,93 @@ def create_dashboard_template():
                 document.getElementById('currentFile').title = filename; // Show full name on hover
             } else {
                 document.getElementById('currentFile').textContent = filename || '-';
+            }
+        }
+
+        // Configuration management
+        function loadConfig() {
+            const saved = localStorage.getItem('pipelineConfig');
+            if (saved) {
+                config = { ...config, ...JSON.parse(saved) };
+            }
+            updateConfigModal();
+        }
+        
+        function saveConfig() {
+            // Get values from modal
+            config.zscoreThreshold = parseFloat(document.getElementById('zscoreThreshold').value);
+            config.zscoreHigh = parseFloat(document.getElementById('zscoreHigh').value);
+            config.zscoreMedium = parseFloat(document.getElementById('zscoreMedium').value);
+            config.zscoreLow = parseFloat(document.getElementById('zscoreLow').value);
+            config.amplitudeThreshold = parseFloat(document.getElementById('amplitudeThreshold').value);
+            config.amplitudeHigh = parseFloat(document.getElementById('amplitudeHigh').value);
+            config.amplitudeMedium = parseFloat(document.getElementById('amplitudeMedium').value);
+            config.amplitudeLow = parseFloat(document.getElementById('amplitudeLow').value);
+            config.minConfidence = parseFloat(document.getElementById('minConfidence').value);
+            config.maxAlertsPerSecond = parseInt(document.getElementById('maxAlertsPerSecond').value);
+            
+            // Save to localStorage
+            localStorage.setItem('pipelineConfig', JSON.stringify(config));
+            
+            // Update filter settings
+            filterSettings.minConfidence = config.minConfidence;
+            
+            alert('Configuration saved successfully!');
+            closeConfigModal();
+        }
+        
+        function resetConfig() {
+            if (confirm('Reset all settings to defaults?')) {
+                config = {
+                    zscoreThreshold: 4.0,
+                    zscoreHigh: 6.0,
+                    zscoreMedium: 5.0,
+                    zscoreLow: 4.0,
+                    amplitudeThreshold: 3.5,
+                    amplitudeHigh: 5.0,
+                    amplitudeMedium: 4.0,
+                    amplitudeLow: 3.5,
+                    minConfidence: 0.3,
+                    maxAlertsPerSecond: 5
+                };
+                localStorage.removeItem('pipelineConfig');
+                updateConfigModal();
+            }
+        }
+        
+        function updateConfigModal() {
+            document.getElementById('zscoreThreshold').value = config.zscoreThreshold;
+            document.getElementById('zscoreHigh').value = config.zscoreHigh;
+            document.getElementById('zscoreMedium').value = config.zscoreMedium;
+            document.getElementById('zscoreLow').value = config.zscoreLow;
+            document.getElementById('amplitudeThreshold').value = config.amplitudeThreshold;
+            document.getElementById('amplitudeHigh').value = config.amplitudeHigh;
+            document.getElementById('amplitudeMedium').value = config.amplitudeMedium;
+            document.getElementById('amplitudeLow').value = config.amplitudeLow;
+            document.getElementById('minConfidence').value = config.minConfidence;
+            document.getElementById('confidenceDisplay').textContent = config.minConfidence;
+            document.getElementById('maxAlertsPerSecond').value = config.maxAlertsPerSecond;
+        }
+        
+        function updateConfigSummary() {
+            const summary = document.getElementById('configSummary');
+            summary.innerHTML = `
+                <div><strong>Z-Score Detection:</strong> Threshold ${config.zscoreThreshold}σ (HIGH > ${config.zscoreHigh}σ, MEDIUM > ${config.zscoreMedium}σ)</div>
+                <div><strong>Amplitude Detection:</strong> Threshold ${config.amplitudeThreshold}× baseline (HIGH > ${config.amplitudeHigh}×, MEDIUM > ${config.amplitudeMedium}×)</div>
+                <div><strong>Min Confidence:</strong> ${(config.minConfidence * 100).toFixed(0)}%</div>
+                <div><strong>Max Alerts/Second:</strong> ${config.maxAlertsPerSecond}</div>
+            `;
+        }
+        
+        // Update confidence display when slider changes
+        document.getElementById('minConfidence').addEventListener('input', function(e) {
+            document.getElementById('confidenceDisplay').textContent = e.target.value;
+        });
+        
+        // Close modals when clicking outside
+        window.onclick = function(event) {
+            if (event.target.classList.contains('modal')) {
+                event.target.style.display = 'none';
             }
         }
 
